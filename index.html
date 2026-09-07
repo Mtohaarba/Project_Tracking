@@ -63,7 +63,6 @@
 
     <video id="webcam" autoplay playsinline muted></video>
 
- 
 
     <script>
         const PARTICLE_COUNT = 8000;
@@ -471,4 +470,65 @@
             if (isThumbOpen && !isIndexOpen && !isMiddleOpen && !isRingOpen && !isPinkyOpen) {
                 return 4;
             }
-            if (!
+            if (!isIndexOpen && !isMiddleOpen && !isRingOpen && !isPinkyOpen) {
+                return 1; // ✊ hati
+            }
+            if (isIndexOpen && isMiddleOpen && isRingOpen && isPinkyOpen) {
+                return 0; // ✋ awan
+            }
+
+            return activeShapeIndex;
+        }
+
+        function onResults(results) {
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const lm = results.multiHandLandmarks[0];
+                setShape(detectGesture(lm));
+
+                // BARU: terus update posisi & arah telunjuk selama mode aktif
+                if (activeShapeIndex === 2) {
+                    updateFingertip(lm);
+                }
+
+                // bonus: border webcam ganti warna kalo mode aktif
+                videoElement.style.borderColor = activeShapeIndex === 2 ? '#ffaa00' : '#00ffcc';
+            }
+        }
+
+        const videoElement = document.getElementById('webcam');
+        const errorMsg = document.getElementById('error-msg');
+
+        initThreeJS();
+
+        const hands = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.6,
+            minTrackingConfidence: 0.6
+        });
+
+        hands.onResults(onResults);
+
+        navigator.mediaDevices.getUserMedia({ video: true })
+            .then((stream) => {
+                videoElement.srcObject = stream;
+                const cameraUtils = new Camera(videoElement, {
+                    onFrame: async () => {
+                        await hands.send({ image: videoElement });
+                    },
+                    width: 480,
+                    height: 360
+                });
+                cameraUtils.start();
+            })
+            .catch((err) => {
+                console.error("Akses kamera ditolak/gagal:", err);
+                errorMsg.style.display = "block";
+            });
+    </script>
+</body>
+</html>
