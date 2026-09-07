@@ -11,18 +11,40 @@
             background-color: #050505;
             font-family: Arial, sans-serif;
         }
-        #webcam {
+        /* ===== DIPERBESAR: wrapper kamera + canvas skeleton ===== */
+        #cam-wrap {
             position: absolute;
             bottom: 20px;
             left: 20px;
-            width: 180px;
-            height: 135px;
+            width: 320px;
+            height: 240px;
             border: 2px solid #00ffcc;
-            border-radius: 8px;
-            transform: scaleX(-1);
+            border-radius: 10px;
+            overflow: hidden;
             z-index: 10;
             background-color: #111;
             transition: border-color 0.3s;
+        }
+        #webcam, #hand-canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            transform: scaleX(-1); /* video & skeleton sama-sama di-mirror */
+        }
+        #hand-canvas { pointer-events: none; }
+        #track-status {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            padding: 4px 10px;
+            font-size: 11px;
+            font-weight: bold;
+            color: #aaa;
+            background: linear-gradient(rgba(0,0,0,0.75), transparent);
+            z-index: 5;
         }
         #error-msg {
             position: absolute;
@@ -56,17 +78,22 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
     <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <!-- BARU: buat gambar skeleton tracking -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
 </head>
 <body>
 
     <div id="error-msg">⚠️ Kamera tidak terdeteksi atau izin akses kamera ditolak!<br>Mohon izinkan akses kamera pada browser Anda.</div>
 
-    <video id="webcam" autoplay playsinline muted></video>
-
+    <div id="cam-wrap">
+        <video id="webcam" autoplay playsinline muted></video>
+        <canvas id="hand-canvas" width="640" height="480"></canvas>
+        <div id="track-status">⚪ MENCARI TANGAN...</div>
+    </div>
 
     <script>
         const PARTICLE_COUNT = 8000;
-        let scene, camera, renderer, particles, geometry, particleMaterial;
+        let scene, camera, renderer, particles, geometry, particleMaterial, tipMarker;
         let currentPositions = new Float32Array(PARTICLE_COUNT * 3);
         let targetPositions = new Float32Array(PARTICLE_COUNT * 3);
         let currentColors = new Float32Array(PARTICLE_COUNT * 3);
@@ -74,16 +101,24 @@
 
         let activeShapeIndex = 0;
 
-        // ==================== BARU: state mode "ikut jari" ====================
-        let fingertipTarget = new THREE.Vector3(0, 0, 0); // posisi ujung telunjuk di dunia 3D
-        let fingertipSmooth = new THREE.Vector3(0, 0, 0); // versi smoothing biar gak geter
-        let prevTipPos = new THREE.Vector3();             // posisi frame lalu (buat ekor)
+        // ==================== mode "ikut jari" ====================
+        let fingertipTarget = new THREE.Vector3(0, 0, 0);
+        let fingertipSmooth = new THREE.Vector3(0, 0, 0);
+        let prevTipPos = new THREE.Vector3();
         let tipVelocity = new THREE.Vector3();
-        let fingerDir = new THREE.Vector3(0, 1, 0);       // arah tunjukan telunjuk
+        let fingerDir = new THREE.Vector3(0, 1, 0);
         let hasTipData = false;
         let followTime = 0;
         let followOffsets, followRand;
-        // ======================================================================
+
+        // ============ BARU: kontrol rotasi dari tracking tangan ============
+        // semua objek rotasinya dikontrol posisi + kemiringan telapak tangan
+        let handRotTarget = { x: 0, y: 0, z: 0 }; // target dari tracking
+        let handRot = { x: 0, y: 0, z: 0 };       // versi smoothing
+        let handInfluence = 0;      // 0 = tangan gak terdeteksi, 1 = terdeteksi
+        let handInfluenceTarget = 0;
+        let autoRot = { x: 0, y: 0, z: 0 };       // rotasi otomatis (spin) tiap bentuk
+        // ====================================================================
 
         function getCloudPositions() {
             const pos = new Float32Array(PARTICLE_COUNT * 3);
@@ -169,10 +204,9 @@
             return pos;
         }
 
-        // ============ BARU: data partikel buat mode "ikut jari" ============
         function initFollowData() {
-            followOffsets = new Float32Array(PARTICLE_COUNT * 3); // posisi acak dalam bola
-            followRand = new Float32Array(PARTICLE_COUNT);        // pembagi swarm vs beam
+            followOffsets = new Float32Array(PARTICLE_COUNT * 3);
+            followRand = new Float32Array(PARTICLE_COUNT);
             for (let i = 0; i < PARTICLE_COUNT; i++) {
                 const theta = Math.random() * Math.PI * 2;
                 const phi = Math.acos(2 * Math.random() - 1);
@@ -189,12 +223,10 @@
             for (let i = 0; i < PARTICLE_COUNT; i++) {
                 const rnd = followRand[i];
                 if (rnd >= 0.55) {
-                    // partikel beam: putih keemasan terang
                     col[i * 3] = 1.0;
                     col[i * 3 + 1] = 0.95;
                     col[i * 3 + 2] = 0.75;
                 } else {
-                    // partikel swarm: gradasi putih panas (tengah) → oranye (tepi)
                     const ox = followOffsets[i * 3];
                     const oy = followOffsets[i * 3 + 1];
                     const oz = followOffsets[i * 3 + 2];
@@ -207,7 +239,6 @@
             }
             return col;
         }
-        // ====================================================================
 
         function getCloudColors() {
             const col = new Float32Array(PARTICLE_COUNT * 3);
@@ -260,7 +291,7 @@
         const shapes = [
             getCloudPositions(),   // 0: awan
             getHeartPositions(),   // 1: hati
-            null,                  // 2: mode ikut jari (posisi di-update tiap frame)
+            null,                  // 2: mode ikut jari
             getTextPositions(),    // 3: teks
             getUranusPositions()   // 4: uranus
         ];
@@ -268,7 +299,7 @@
         const shapeColors = [
             getCloudColors(),
             getHeartColors(),
-            getFollowColors(),     // warna emas komet ✨
+            getFollowColors(),
             getTextColor(),
             getUranusColors()
         ];
@@ -307,13 +338,21 @@
             particles = new THREE.Points(geometry, particleMaterial);
             scene.add(particles);
 
+            // BARU: marker bola emas di ujung telunjuk (mode ☝️)
+            tipMarker = new THREE.Mesh(
+                new THREE.SphereGeometry(0.09, 16, 16),
+                new THREE.MeshBasicMaterial({ color: 0xffcc44, transparent: true, opacity: 0.9 })
+            );
+            tipMarker.visible = false;
+            scene.add(tipMarker);
+
             window.addEventListener('resize', onWindowResize);
             animate();
         }
 
         function setShape(shapeIndex) {
             if (activeShapeIndex === shapeIndex) return;
-            if (activeShapeIndex === 2) hasTipData = false; // reset kalau keluar dari mode follow
+            if (activeShapeIndex === 2) hasTipData = false;
             activeShapeIndex = shapeIndex;
 
             const targetCol = shapeColors[shapeIndex];
@@ -321,7 +360,6 @@
                 targetColors[i] = targetCol[i];
             }
 
-            // posisi mode follow dihitung di animate(), bukan di sini
             if (shapeIndex !== 2) {
                 const targetPos = shapes[shapeIndex];
                 for (let i = 0; i < PARTICLE_COUNT * 3; i++) {
@@ -330,20 +368,17 @@
             }
         }
 
-        // ===== BARU: ubah posisi landmark MediaPipe (0-1) jadi koordinat dunia 3D =====
         function updateFingertip(lm) {
-            const tip = lm[8];  // ujung telunjuk
-            const pip = lm[6];  // sendi telunjuk
+            const tip = lm[8];
+            const pip = lm[6];
 
-            // ukuran area yang terlihat kamera di bidang z=0
             const visH = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * camera.position.z;
             const visW = visH * camera.aspect;
 
-            // x dibalik (0.5 - x) karena video di-mirror, y dibalik karena layar
             const raw = new THREE.Vector3(
                 (0.5 - tip.x) * visW,
                 (0.5 - tip.y) * visH,
-                THREE.MathUtils.clamp(-tip.z * 8, -5, 5)  // maju/mundurin tangan = depth
+                THREE.MathUtils.clamp(-tip.z * 8, -5, 5)
             );
 
             if (!hasTipData) {
@@ -352,10 +387,9 @@
                 hasTipData = true;
             }
 
-            fingertipSmooth.lerp(raw, 0.45); // smoothing biar gak jitter
+            fingertipSmooth.lerp(raw, 0.45);
             fingertipTarget.copy(fingertipSmooth);
 
-            // arah telunjuk (sendi → ujung), diproyeksikan ke bidang layar
             const dx = (pip.x - tip.x) * visW;
             const dy = (pip.y - tip.y) * visH;
             const len = Math.sqrt(dx * dx + dy * dy);
@@ -363,7 +397,29 @@
                 fingerDir.lerp(new THREE.Vector3(dx / len, dy / len, 0), 0.3).normalize();
             }
         }
-        // =============================================================================
+
+        // ============ BARU: update target rotasi dari tracking telapak tangan ============
+        function updateHandRotation(lm) {
+            // titik tengah telapak pakai landmark 9 (sendi tengah jari tengah)
+            const px = lm[9].x;
+            const py = lm[9].y;
+
+            // geser tangan kanan/kiri → objek muter ke kanan/kiri (sumbu Y)
+            // (x dibalik karena video di-mirror)
+            handRotTarget.y = (0.5 - px) * 2.6;
+
+            // geser tangan atas/bawah → objek ikut naik/turun (sumbu X)
+            handRotTarget.x = (py - 0.5) * 2.2;
+
+            // miringin telapak tangan → objek ikut miring (sumbu Z)
+            // dihitung dari sudut vektor pergelangan (0) → sendi tengah (9)
+            const dx = lm[9].x - lm[0].x;
+            const dy = lm[9].y - lm[0].y;
+            handRotTarget.z = Math.atan2(dx, -dy) * 0.9;
+
+            handInfluenceTarget = 1;
+        }
+        // ==================================================================================
 
         function animate() {
             requestAnimationFrame(animate);
@@ -371,7 +427,6 @@
             const positions = geometry.attributes.position.array;
             const colorsAttr = geometry.attributes.color.array;
 
-            // ===== BARU: hitung target posisi pas mode "ikut jari" =====
             if (activeShapeIndex === 2) {
                 followTime += 0.03;
                 tipVelocity.copy(fingertipTarget).sub(prevTipPos);
@@ -387,7 +442,6 @@
                     const rnd = followRand[i];
 
                     if (rnd < 0.55) {
-                        // swarm: muter-muter ngelilingi ujung jari + ekor kalau gerak cepet
                         const rx = ox * cosT - oz * sinT;
                         const rz = ox * sinT + oz * cosT;
                         const tail = rnd * 4;
@@ -395,7 +449,6 @@
                         targetPositions[i * 3 + 1] = fingertipTarget.y + oy - tipVelocity.y * tail;
                         targetPositions[i * 3 + 2] = fingertipTarget.z + rz - tipVelocity.z * tail;
                     } else {
-                        // beam: ngalir ke arah yang ditunjuk telunjuk
                         const beamLen = (rnd - 0.55) / 0.45 * 3.5;
                         targetPositions[i * 3]     = fingertipTarget.x + fingerDir.x * beamLen + ox * 0.08;
                         targetPositions[i * 3 + 1] = fingertipTarget.y + fingerDir.y * beamLen + oy * 0.08;
@@ -403,9 +456,7 @@
                     }
                 }
             }
-            // ============================================================
 
-            // di mode follow partikel dipercepet biar ngejarnya responsif
             const lerpFactor = activeShapeIndex === 2 ? 0.18 : 0.1;
 
             for (let i = 0; i < PARTICLE_COUNT * 3; i++) {
@@ -415,24 +466,50 @@
             geometry.attributes.position.needsUpdate = true;
             geometry.attributes.color.needsUpdate = true;
 
-            if (activeShapeIndex === 2 || activeShapeIndex === 3) {
-                // mode follow & teks: rotasi dinolkan biar posisi jari akurat
-                particles.rotation.x = THREE.MathUtils.lerp(particles.rotation.x, 0, 0.1);
-                particles.rotation.y = THREE.MathUtils.lerp(particles.rotation.y, 0, 0.1);
-                particles.rotation.z = THREE.MathUtils.lerp(particles.rotation.z, 0, 0.1);
+            // ============ BARU: smoothing kontrol rotasi dari tangan ============
+            handRot.x += (handRotTarget.x - handRot.x) * 0.08;
+            handRot.y += (handRotTarget.y - handRot.y) * 0.08;
+            handRot.z += (handRotTarget.z - handRot.z) * 0.08;
+            handInfluence += (handInfluenceTarget - handInfluence) * 0.06;
+
+            // kalau tangan ilang, pengaruhnya fade out → objek balik ke spin normal
+            const hx = handRot.x * handInfluence;
+            const hy = handRot.y * handInfluence;
+            const hz = handRot.z * handInfluence;
+
+            // spin otomatis tiap bentuk (tetap jalan, rotasi tangan numpuk di atasnya)
+            let targetRX, targetRY, targetRZ;
+            if (activeShapeIndex === 2) {
+                // mode ikut jari: rotasi harus nol biar posisi jari akurat
+                targetRX = targetRY = targetRZ = 0;
+            } else if (activeShapeIndex === 3) {
+                // teks: gak ada spin otomatis, murni ngikutin tangan
+                targetRX = hx; targetRY = hy; targetRZ = hz;
             } else if (activeShapeIndex === 1) {
-                particles.rotation.y += 0.01;
-                particles.rotation.x = THREE.MathUtils.lerp(particles.rotation.x, 0, 0.1);
-                particles.rotation.z = THREE.MathUtils.lerp(particles.rotation.z, 0, 0.1);
+                autoRot.y += 0.01;
+                targetRY = autoRot.y + hy; targetRX = hx; targetRZ = hz;
             } else if (activeShapeIndex === 4) {
-                particles.rotation.y += 0.012;
-                particles.rotation.x += 0.008;
-                particles.rotation.z += 0.003;
+                autoRot.y += 0.012; autoRot.x += 0.008; autoRot.z += 0.003;
+                targetRY = autoRot.y + hy; targetRX = autoRot.x + hx; targetRZ = autoRot.z + hz;
             } else {
-                particles.rotation.y += 0.005;
+                autoRot.y += 0.005;
+                targetRY = autoRot.y + hy; targetRX = hx; targetRZ = hz;
             }
 
-            // partikel dibesarin dikit di mode follow biar lebih "magic"
+            particles.rotation.x += (targetRX - particles.rotation.x) * 0.1;
+            particles.rotation.y += (targetRY - particles.rotation.y) * 0.1;
+            particles.rotation.z += (targetRZ - particles.rotation.z) * 0.1;
+            // =====================================================================
+
+            // BARU: marker ujung telunjuk
+            if (activeShapeIndex === 2 && hasTipData) {
+                tipMarker.visible = true;
+                tipMarker.position.copy(fingertipSmooth);
+                tipMarker.scale.setScalar(1 + Math.sin(followTime * 3) * 0.25); // denyut
+            } else {
+                tipMarker.visible = false;
+            }
+
             const targetSize = activeShapeIndex === 2 ? 0.1 : 0.06;
             particleMaterial.size += (targetSize - particleMaterial.size) * 0.1;
 
@@ -451,7 +528,6 @@
         }
 
         function detectGesture(landmarks) {
-            // BARU: deteksi jempol (ujung jempol lebih jauh dari telapak kelingking)
             const isThumbOpen = distSq(landmarks[4], landmarks[17]) > distSq(landmarks[3], landmarks[17]) * 1.15;
 
             const isIndexOpen = landmarks[8].y < landmarks[6].y;
@@ -460,42 +536,79 @@
             const isPinkyOpen = landmarks[20].y < landmarks[18].y;
 
             if (isIndexOpen && isMiddleOpen && !isRingOpen && !isPinkyOpen) {
-                return 3; // ✌️ teks
+                return 3;
             }
-            // BARU: telunjuk doang = mode ikut jari
             if (isIndexOpen && !isMiddleOpen && !isRingOpen && !isPinkyOpen) {
                 return 2;
             }
-            // BARU: jempol doang = uranus
             if (isThumbOpen && !isIndexOpen && !isMiddleOpen && !isRingOpen && !isPinkyOpen) {
                 return 4;
             }
             if (!isIndexOpen && !isMiddleOpen && !isRingOpen && !isPinkyOpen) {
-                return 1; // ✊ hati
+                return 1;
             }
             if (isIndexOpen && isMiddleOpen && isRingOpen && isPinkyOpen) {
-                return 0; // ✋ awan
+                return 0;
             }
 
             return activeShapeIndex;
         }
 
+        // ============ BARU: gambar skeleton tracking hijau di atas video ============
+        function drawSkeleton(results) {
+            const ctx = handCanvas.getContext('2d');
+            ctx.clearRect(0, 0, handCanvas.width, handCanvas.height);
+
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const lm = results.multiHandLandmarks[0];
+
+                // garis penghubung antar tulang jari (warna ijo)
+                drawConnectors(ctx, lm, HAND_CONNECTIONS, {
+                    color: '#00ff66',
+                    lineWidth: 4
+                });
+
+                // titik di setiap sendi
+                drawLandmarks(ctx, lm, {
+                    color: '#00ff66',
+                    fillColor: '#ffffff',
+                    lineWidth: 1,
+                    radius: 4
+                });
+            }
+        }
+        // ============================================================================
+
         function onResults(results) {
+            drawSkeleton(results);
+
             if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
                 const lm = results.multiHandLandmarks[0];
                 setShape(detectGesture(lm));
 
-                // BARU: terus update posisi & arah telunjuk selama mode aktif
+                // BARU: tracking telapak → kontrol rotasi semua objek
+                updateHandRotation(lm);
+
                 if (activeShapeIndex === 2) {
                     updateFingertip(lm);
                 }
 
-                // bonus: border webcam ganti warna kalo mode aktif
-                videoElement.style.borderColor = activeShapeIndex === 2 ? '#ffaa00' : '#00ffcc';
+                trackStatus.textContent = '🟢 TANGAN TERDETEKSI';
+                trackStatus.style.color = '#00ff66';
+                camWrap.style.borderColor = activeShapeIndex === 2 ? '#ffaa00' : '#00ffcc';
+            } else {
+                // tangan hilang → kontrol rotasi fade out
+                handInfluenceTarget = 0;
+                trackStatus.textContent = '⚪ MENCARI TANGAN...';
+                trackStatus.style.color = '#aaa';
+                camWrap.style.borderColor = '#00ffcc';
             }
         }
 
         const videoElement = document.getElementById('webcam');
+        const handCanvas = document.getElementById('hand-canvas');
+        const trackStatus = document.getElementById('track-status');
+        const camWrap = document.getElementById('cam-wrap');
         const errorMsg = document.getElementById('error-msg');
 
         initThreeJS();
@@ -520,8 +633,8 @@
                     onFrame: async () => {
                         await hands.send({ image: videoElement });
                     },
-                    width: 480,
-                    height: 360
+                    width: 640,   // BARU: naikin resolusi biar tracking lebih akurat
+                    height: 480
                 });
                 cameraUtils.start();
             })
